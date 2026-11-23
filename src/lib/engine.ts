@@ -6,6 +6,8 @@ import { stripSpeakerPrefix } from "./rp-text";
 import { replyContextText, replyStoryText } from "./reply-markup.ts";
 import { resolveImageWrite, imageWriteFields } from "./image-ai.ts";
 import { buildIdlecloudBody, buildNaiPayload } from "./nai";
+import { directFetch, directPoll, directSubmit, DirectFileError } from "./nai-direct";
+import { normalizeNaiBase } from "./nai-base";
 import { sanitizeNaiTags, assignCharTags, extractJsonObject, resolveAbsentIds, presenceFromTags, legacyPresentIds } from "./nai-tags";
 import { IMAGE_DRAW_TIMEOUT_MS, IMAGE_GEN_TIMEOUT_MS, NAI_HOP_TIMEOUT_MS, NAI_POLL_MS, RECENT_TURNS } from "./constants";
 import { getImage } from "./idb";
@@ -537,11 +539,16 @@ export async function generateNai(opts: {
     const randomSnap = before && rolled.bank ? captureRandomSnap(before, rolled.bank, rolled.usedItemIds) : undefined;
     return { blobId: saved.blobId, seed: built.seed, prompt: built.finalPrompt, blob: saved.blob, randomSnap };
   };
-  const base = { baseUrl: opts.baseUrl, apiKey: opts.apiKey };
+  const base = { baseUrl: normalizeNaiBase(opts.baseUrl), apiKey: opts.apiKey };
   const take = async (extra: Record<string, unknown>, timeoutMs?: number) => {
     const hop = await naiHop({ ...base, ...extra }, opts.signal, timeoutMs);
     if (hop.baseUrl) base.baseUrl = hop.baseUrl;
     return hop;
+  };
+  const note = (next?: string) => {
+    if (!next) return;
+    base.baseUrl = next;
+    if (next !== useApp.getState().settings.naiBase) useApp.getState().setSettings({ naiBase: next });
   };
   if (opts.mode === "official") {
     const parameters = { ...built.parameters };
@@ -570,7 +577,8 @@ export async function generateNai(opts: {
   while (!submit) {
     if (timedOut()) throw new Error("生图超时");
     try {
-      submit = await take({ action: "submit", payload });
+      submit = await directSubmit(base.baseUrl, base.apiKey, payload, opts.signal);
+      note(submit.baseUrl);
     } catch (e) {
       if (isHopTimeout(e)) continue;
       throw e;
@@ -584,7 +592,13 @@ export async function generateNai(opts: {
   while (!timedOut()) {
     if (fileUrl) {
       try {
-        const fetched = await take({ action: "fetch", fileUrl, v5 });
+        let fetched;
+        try {
+          fetched = await directFetch(base.baseUrl, base.apiKey, fileUrl, v5, opts.signal);
+        } catch (e) {
+          if (!(e instanceof DirectFileError)) throw e;
+          fetched = await take({ action: "fetch", fileUrl, v5 });
+        }
         if (fetched.image) return finish(fetched.image);
       } catch (e) {
         if (!isHopTimeout(e)) throw e;
@@ -594,7 +608,8 @@ export async function generateNai(opts: {
     }
     let poll: NaiHop;
     try {
-      poll = await take({ action: "poll", jobId: submit.jobId, statusUrl });
+      poll = await directPoll(base.baseUrl, base.apiKey, submit.jobId, statusUrl, opts.signal);
+      note(poll.baseUrl);
     } catch (e) {
       if (isHopTimeout(e)) continue;
       throw e;
