@@ -4,6 +4,7 @@ import {
   NAI_MODELS,
   SENSITIVE_PREFIX,
   UNCENSORED_TAG,
+  DEFAULT_NAI_BASE,
   joinPromptParts,
 } from "./constants";
 import type { CharacterPrompt, ImageParams, NaiModelId } from "./types";
@@ -23,7 +24,7 @@ export function naiDrawAuth(settings: {
     return { mode: "official", apiKey: settings.naiOfficialKey.trim(), baseUrl: NAI_OFFICIAL_BASE };
   }
   if (settings.naiConnected && settings.naiKey?.trim()) {
-    return { mode: "proxy", apiKey: settings.naiKey.trim(), baseUrl: settings.naiBase || "https://api.idlecloud.cc" };
+    return { mode: "proxy", apiKey: settings.naiKey.trim(), baseUrl: settings.naiBase || DEFAULT_NAI_BASE };
   }
   return null;
 }

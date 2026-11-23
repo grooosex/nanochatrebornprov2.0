@@ -116,7 +116,7 @@ export const UC: Record<Exclude<UcPreset, "custom">, string> = {
     "lowres, artistic error, scan, worst quality, bad quality, jpeg artifacts, very displeasing, overly naturalistic, logo, too many watermarks, negativeXL, negative, extra digits, bad anatomy",
 };
 
-export const DEFAULT_NAI_BASE = "https://api.idlecloud.cc";
+export const DEFAULT_NAI_BASE = "https://api.yihan.art";
 
 export const SENSITIVE_PREFIX = "rating: sensitive, nsfw, uncensored,";
 export const UNCENSORED_TAG = "uncensored,";

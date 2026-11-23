@@ -401,6 +401,7 @@ type NaiHop = {
   statusUrl?: string;
   fileUrl?: string;
   pending?: boolean;
+  baseUrl?: string;
   v5?: {
     confirm_url?: string;
     confirmation_required?: boolean;
@@ -458,6 +459,9 @@ async function naiHop(body: Record<string, unknown>, signal?: AbortSignal, timeo
     data = JSON.parse(raw) as NaiHop;
   } catch {
     throw new Error("中转站返回了异常页面");
+  }
+  if (data.baseUrl && data.baseUrl !== useApp.getState().settings.naiBase) {
+    useApp.getState().setSettings({ naiBase: data.baseUrl });
   }
   if (!data.ok) throw new Error(data.error || "生图失败");
   return data;
@@ -534,6 +538,11 @@ export async function generateNai(opts: {
     return { blobId: saved.blobId, seed: built.seed, prompt: built.finalPrompt, blob: saved.blob, randomSnap };
   };
   const base = { baseUrl: opts.baseUrl, apiKey: opts.apiKey };
+  const take = async (extra: Record<string, unknown>, timeoutMs?: number) => {
+    const hop = await naiHop({ ...base, ...extra }, opts.signal, timeoutMs);
+    if (hop.baseUrl) base.baseUrl = hop.baseUrl;
+    return hop;
+  };
   if (opts.mode === "official") {
     const parameters = { ...built.parameters };
     let action = "generate";
@@ -561,7 +570,7 @@ export async function generateNai(opts: {
   while (!submit) {
     if (timedOut()) throw new Error("生图超时");
     try {
-      submit = await naiHop({ ...base, action: "submit", payload }, opts.signal);
+      submit = await take({ action: "submit", payload });
     } catch (e) {
       if (isHopTimeout(e)) continue;
       throw e;
@@ -575,7 +584,7 @@ export async function generateNai(opts: {
   while (!timedOut()) {
     if (fileUrl) {
       try {
-        const fetched = await naiHop({ ...base, action: "fetch", fileUrl, v5 }, opts.signal);
+        const fetched = await take({ action: "fetch", fileUrl, v5 });
         if (fetched.image) return finish(fetched.image);
       } catch (e) {
         if (!isHopTimeout(e)) throw e;
@@ -585,7 +594,7 @@ export async function generateNai(opts: {
     }
     let poll: NaiHop;
     try {
-      poll = await naiHop({ ...base, action: "poll", jobId: submit.jobId, statusUrl }, opts.signal);
+      poll = await take({ action: "poll", jobId: submit.jobId, statusUrl });
     } catch (e) {
       if (isHopTimeout(e)) continue;
       throw e;

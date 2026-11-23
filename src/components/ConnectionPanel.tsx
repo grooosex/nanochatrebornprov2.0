@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Check, ChevronDown, Download, FileUp, Lock, Pencil, RotateCcw, Settings, Star, Trash2, Upload, X } from "lucide-react";
 import { DEFAULT_NAI_BASE, shortModelLabel } from "@/lib/constants";
+import { normalizeNaiBase } from "@/lib/nai-base";
 import { exportArchive, importArchive } from "@/lib/archive";
 import { fetchLlmModels } from "@/lib/grok-client";
 import { applyLlmPick, catalogFromLinks, isMultiLlm, llmModelLabel, llmModelName, parseLlmModelKey, pruneStarred, snapshotLlmAccount } from "@/lib/llm-models";
@@ -889,19 +890,56 @@ function ChatPresetPicker() {
   );
 }
 
-async function naiProbe(body: Record<string, unknown>) {
-  let j: { ok?: boolean; error?: string };
+async function probeNaiFromBrowser(baseUrl: string, apiKey: string): Promise<{ kind: "ok"; baseUrl: string } | { kind: "bad"; error: string } | { kind: "skip" }> {
+  const root = normalizeNaiBase(baseUrl);
+  let r: Response;
   try {
-    const r = await fetch("/api/nai", {
+    r = await fetch(`${root}/api/user/subscription`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  } catch {
+    return { kind: "skip" };
+  }
+  const text = await r.text();
+  const head = text.slice(0, 400).toLowerCase();
+  if (head.includes("just a moment") || head.includes("<!doctype") || head.includes("<html")) return { kind: "skip" };
+  let message = "";
+  try {
+    const json = JSON.parse(text) as { message?: string };
+    message = typeof json.message === "string" ? json.message : "";
+  } catch {
+    return { kind: "skip" };
+  }
+  if (r.status === 401 || r.status === 403) return { kind: "bad", error: "API Key 无效或档位不够，请重新填写" };
+  if (!r.ok) return { kind: "bad", error: message || "中转站连接失败" };
+  return { kind: "ok", baseUrl: root };
+}
+
+async function naiProbe(body: Record<string, unknown>) {
+  let r: Response;
+  try {
+    r = await fetch("/api/nai", {
       method: "POST",
+      cache: "no-store",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    j = (await r.json()) as { ok?: boolean; error?: string };
   } catch {
     throw new Error("无法连接");
   }
-  if (!j.ok) throw new Error(j.error || "连接失败");
+  const raw = await r.text();
+  let j: { ok?: boolean; error?: string; baseUrl?: string };
+  try {
+    j = JSON.parse(raw) as { ok?: boolean; error?: string; baseUrl?: string };
+  } catch {
+    throw new Error(raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "无法连接");
+  }
+  if (!j.ok) {
+    const err = new Error(j.error || "连接失败") as Error & { baseUrl?: string };
+    err.baseUrl = j.baseUrl;
+    throw err;
+  }
+  return j;
 }
 
 function ImageAiSheet({ onClose }: { onClose: () => void }) {
@@ -921,8 +959,9 @@ function ImageAiSheet({ onClose }: { onClose: () => void }) {
   }, [settings.naiBase, settings.naiKey, settings.naiOfficialKey]);
 
   const connectProxy = async () => {
-    const b = base.trim() || DEFAULT_NAI_BASE;
-    const k = key.trim();
+    const live = useApp.getState().settings;
+    const b = (base || live.naiBase || DEFAULT_NAI_BASE).trim() || DEFAULT_NAI_BASE;
+    const k = (key || live.naiKey || "").trim().replace(/^Bearer\s+/i, "").replace(/^['"]|['"]$/g, "");
     if (!k) {
       useApp.getState().toast("请填写中转站密钥");
       return;
@@ -930,9 +969,13 @@ function ImageAiSheet({ onClose }: { onClose: () => void }) {
     setBusy(true);
     setErr("");
     try {
-      await naiProbe({ action: "test", baseUrl: b, apiKey: k });
+      const direct = await probeNaiFromBrowser(b, k);
+      if (direct.kind === "bad") throw new Error(direct.error);
+      const j = direct.kind === "ok" ? direct : await naiProbe({ action: "test", baseUrl: b, apiKey: k });
+      const saved = j.baseUrl || normalizeNaiBase(b);
+      setBase(saved);
       useApp.getState().setSettings({
-        naiBase: b,
+        naiBase: saved,
         naiKey: k,
         naiConnected: true,
         naiOfficialConnected: false,
@@ -941,8 +984,10 @@ function ImageAiSheet({ onClose }: { onClose: () => void }) {
       useApp.getState().toast("已连接中转站");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "连接失败";
+      const saved = e && typeof e === "object" && "baseUrl" in e && typeof e.baseUrl === "string" && e.baseUrl ? e.baseUrl : b;
+      setBase(saved);
       setErr(msg);
-      useApp.getState().setSettings({ naiBase: b, naiKey: k, naiConnected: false });
+      useApp.getState().setSettings({ naiBase: saved, naiKey: k, naiConnected: false });
     } finally {
       setBusy(false);
     }

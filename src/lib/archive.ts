@@ -115,7 +115,7 @@ export async function exportArchive(kind: "full" | "lite" | "partial") {
       stImageActiveId: null,
       stWechatActiveId: null,
       naiKey: "",
-      naiBase: "https://api.idlecloud.cc",
+      naiBase: "https://api.yihan.art",
       naiConnected: false,
       cooldownUntil: 0,
       chatImage: true,

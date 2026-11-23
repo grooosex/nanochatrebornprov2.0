@@ -1,19 +1,23 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { unzipSync } from "fflate";
-import { NAI_HOP_TIMEOUT_MS } from "@/lib/constants";
-
-function normalizeBase(url: string) {
-  return (url || "https://api.idlecloud.cc").replace(/\/+$/, "");
-}
+import { DEFAULT_NAI_BASE, NAI_HOP_TIMEOUT_MS } from "@/lib/constants";
+import { naiMigrationBase, normalizeNaiBase } from "@/lib/nai-base";
 
 function absUrl(base: string, url: string) {
   if (/^https?:\/\//i.test(url)) return url;
-  return normalizeBase(base) + (url.startsWith("/") ? url : `/${url}`);
+  const root = normalizeNaiBase(base);
+  return root + (url.startsWith("/") ? url : `/${url}`);
 }
 
 function looksHtml(text: string) {
   const t = text.trimStart().slice(0, 80).toLowerCase();
   return t.startsWith("<!doctype") || t.startsWith("<html") || t.startsWith("<?xml") || t.includes("<title>internal server error");
+}
+
+function isCfChallenge(status: number, text: string) {
+  if (status !== 403 && status !== 503) return false;
+  const t = text.slice(0, 500).toLowerCase();
+  return t.includes("just a moment") || t.includes("cf-browser-verification") || t.includes("challenge-platform") || t.includes("checking your browser");
 }
 
 function mapIdlecloudError(status: number, body: string) {
@@ -117,9 +121,25 @@ export const Route = createFileRoute("/api/nai")({
           fileUrl?: string;
           v5?: V5Delivery;
         };
-        const base = normalizeBase(body.baseUrl || "https://api.idlecloud.cc");
+        let base = normalizeNaiBase(body.baseUrl || DEFAULT_NAI_BASE);
         const key = (body.apiKey || "").trim();
         if (!key) return Response.json({ ok: false, error: "请填写 NAI API Key" }, { status: 400 });
+
+        const loadAt = async (url: string, init?: RequestInit) => {
+          const pull = async (target: string) => {
+            const res = await fetch(target, init);
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            return { res, bytes, text: new TextDecoder().decode(bytes) };
+          };
+          let got = await pull(url);
+          const moved = naiMigrationBase(got.res.status, got.text);
+          if (moved && moved !== base && (url === base || url.startsWith(`${base}/`))) {
+            const next = moved + url.slice(base.length);
+            base = moved;
+            got = await pull(next);
+          }
+          return got;
+        };
 
         if (body.action === "official-test") {
           try {
@@ -169,19 +189,36 @@ export const Route = createFileRoute("/api/nai")({
           }
         }
 
+        const reply = (data: Record<string, unknown>) => Response.json({ ...data, baseUrl: base });
+
         if (body.action === "test") {
           try {
-            const r = await fetch(`${base}/api/user`, {
-              headers: { Authorization: `Bearer ${key}` },
-            });
-            const text = await r.text();
-            if (r.status === 401 || r.status === 403) {
-              return Response.json({ ok: false, error: mapIdlecloudError(r.status, text) });
+            const url = `${base}/api/user/subscription`;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              if (attempt) await new Promise((resolve) => setTimeout(resolve, 700));
+              const { res, text } = await loadAt(url, {
+                headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+              });
+              let json: unknown = null;
+              if (!looksHtml(text)) {
+                try {
+                  json = JSON.parse(text);
+                } catch {
+                  json = null;
+                }
+              }
+              if (json && typeof json === "object") {
+                if (res.status === 401 || res.status === 403) return reply({ ok: false, error: mapIdlecloudError(res.status, text) });
+                if (!res.ok) return reply({ ok: false, error: mapIdlecloudError(res.status, text) });
+                return reply({ ok: true });
+              }
+              if (!isCfChallenge(res.status, text)) {
+                return reply({ ok: false, error: looksHtml(text) ? "中转站返回了异常页面" : mapIdlecloudError(res.status, text) });
+              }
             }
-            if (r.ok || r.status === 404) return Response.json({ ok: true });
-            return Response.json({ ok: r.status < 500, error: mapIdlecloudError(r.status, text) });
+            return reply({ ok: false, error: "站点防护拦了这次连接，再点一次" });
           } catch (e) {
-            return Response.json({
+            return reply({
               ok: false,
               error: e instanceof Error ? e.message : "无法连接中转站",
             });
@@ -191,16 +228,15 @@ export const Route = createFileRoute("/api/nai")({
         const hop = AbortSignal.timeout(NAI_HOP_TIMEOUT_MS);
         try {
           if (body.action === "fetch") {
-            if (!body.fileUrl) return Response.json({ ok: false, error: "缺少图片地址" });
-            const r = await fetch(absUrl(base, body.fileUrl), { headers: authHeaders(key), signal: hop });
-            const u8 = new Uint8Array(await r.arrayBuffer());
-            if (!r.ok) return Response.json({ ok: false, error: mapIdlecloudError(r.status, new TextDecoder().decode(u8)) });
-            const png = extractPng(u8);
-            if (!png) return Response.json({ ok: false, error: "中转站没有返回图片" });
+            if (!body.fileUrl) return reply({ ok: false, error: "缺少图片地址" });
+            const { res, bytes, text } = await loadAt(absUrl(base, body.fileUrl), { headers: authHeaders(key), signal: hop });
+            if (!res.ok) return reply({ ok: false, error: mapIdlecloudError(res.status, text) });
+            const png = extractPng(bytes);
+            if (!png) return reply({ ok: false, error: "中转站没有返回图片" });
             const v5 = body.v5;
             if (v5?.confirmation_required && v5.confirm_url) {
               try {
-                await fetch(absUrl(base, v5.confirm_url), {
+                await loadAt(absUrl(base, v5.confirm_url), {
                   method: "POST",
                   headers: { ...authHeaders(key), "Content-Type": "application/json" },
                   body: JSON.stringify({ sha256: v5.sha256, size_bytes: v5.size_bytes }),
@@ -209,58 +245,55 @@ export const Route = createFileRoute("/api/nai")({
                 /* confirm is optional */
               }
             }
-            return Response.json({ ok: true, image: toB64(png) });
+            return reply({ ok: true, image: toB64(png) });
           }
 
           if (body.action === "poll") {
-            if (!body.jobId && !body.statusUrl) return Response.json({ ok: false, error: "缺少任务编号" });
+            if (!body.jobId && !body.statusUrl) return reply({ ok: false, error: "缺少任务编号" });
             const url = body.statusUrl ? absUrl(base, body.statusUrl) : `${base}/api/get_result/${body.jobId}`;
-            const r = await fetch(url, { headers: authHeaders(key), signal: hop });
-            const text = await r.text();
-            if (!r.ok) return Response.json({ ok: false, error: mapIdlecloudError(r.status, text) });
-            if (looksHtml(text)) return Response.json({ ok: false, error: "中转站返回了异常页面" });
+            const { res, text } = await loadAt(url, { headers: authHeaders(key), signal: hop });
+            if (!res.ok) return reply({ ok: false, error: mapIdlecloudError(res.status, text) });
+            if (looksHtml(text)) return reply({ ok: false, error: "中转站返回了异常页面" });
             const j = parseJob(text);
-            if (!j) return Response.json({ ok: true, pending: true });
+            if (!j) return reply({ ok: true, pending: true });
             if (j.status === "failed" || (j.error && j.status !== "completed" && !j.image_url && !j.image && !j.v5_delivery?.file_url)) {
-              return Response.json({ ok: false, error: j.error || j.message || "生成失败" });
+              return reply({ ok: false, error: j.error || j.message || "生成失败" });
             }
             const inline = imageField(j.image);
-            if (inline) return Response.json({ ok: true, image: inline });
+            if (inline) return reply({ ok: true, image: inline });
             const fileUrl = j.v5_delivery?.file_url || j.image_url;
             if (j.status === "completed" || fileUrl) {
-              if (!fileUrl) return Response.json({ ok: true, pending: true, statusUrl: j.v5_delivery?.status_url });
-              return Response.json({
+              if (!fileUrl) return reply({ ok: true, pending: true, statusUrl: j.v5_delivery?.status_url });
+              return reply({
                 ok: true,
                 fileUrl,
                 statusUrl: j.v5_delivery?.status_url,
                 v5: j.v5_delivery,
               });
             }
-            return Response.json({ ok: true, pending: true, statusUrl: j.v5_delivery?.status_url });
+            return reply({ ok: true, pending: true, statusUrl: j.v5_delivery?.status_url });
           }
 
-          const r = await fetch(`${base}/api/generate_image`, {
+          const { res, bytes, text } = await loadAt(`${base}/api/generate_image`, {
             method: "POST",
             headers: { ...authHeaders(key), "Content-Type": "application/json" },
             body: JSON.stringify(body.payload ?? {}),
             signal: hop,
           });
-          const u8 = new Uint8Array(await r.arrayBuffer());
-          const text = new TextDecoder().decode(u8);
-          if (!r.ok) return Response.json({ ok: false, error: mapIdlecloudError(r.status, text) });
-          const png = extractPng(u8);
-          if (png && (u8[0] === 0x89 || u8[0] === 0x50)) return Response.json({ ok: true, image: toB64(png) });
-          if (looksHtml(text)) return Response.json({ ok: false, error: "中转站返回了异常页面" });
+          if (!res.ok) return reply({ ok: false, error: mapIdlecloudError(res.status, text) });
+          const png = extractPng(bytes);
+          if (png && (bytes[0] === 0x89 || bytes[0] === 0x50)) return reply({ ok: true, image: toB64(png) });
+          if (looksHtml(text)) return reply({ ok: false, error: "中转站返回了异常页面" });
           const j = parseJob(text);
-          if (!j) return Response.json({ ok: false, error: "中转站返回无法解析" });
+          if (!j) return reply({ ok: false, error: "中转站返回无法解析" });
           const inline = imageField(j.image);
-          if (inline) return Response.json({ ok: true, image: inline });
-          if (j.error && !j.job_id && !j.id) return Response.json({ ok: false, error: j.error });
+          if (inline) return reply({ ok: true, image: inline });
+          if (j.error && !j.job_id && !j.id) return reply({ ok: false, error: j.error });
           const fileUrl = j.v5_delivery?.file_url || j.image_url;
           const jobId = j.job_id || j.id;
-          if (fileUrl && !jobId) return Response.json({ ok: true, fileUrl, v5: j.v5_delivery });
-          if (!jobId && !j.v5_delivery?.status_url) return Response.json({ ok: false, error: "中转站没有返回任务" });
-          return Response.json({
+          if (fileUrl && !jobId) return reply({ ok: true, fileUrl, v5: j.v5_delivery });
+          if (!jobId && !j.v5_delivery?.status_url) return reply({ ok: false, error: "中转站没有返回任务" });
+          return reply({
             ok: true,
             jobId,
             statusUrl: j.v5_delivery?.status_url,
@@ -269,7 +302,7 @@ export const Route = createFileRoute("/api/nai")({
           });
         } catch (e) {
           const abort = (e instanceof DOMException || e instanceof Error) && (e.name === "AbortError" || e.name === "TimeoutError");
-          return Response.json({
+          return reply({
             ok: false,
             error: abort ? "中转站超时，请稍后重试" : e instanceof Error ? e.message : "生图请求失败",
           });
